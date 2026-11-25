@@ -335,6 +335,16 @@ bun x ccusage statusline --visual-burn-rate emoji
 - ⚠️ Moderate (Yellow)
 - 🚨 High (Red)
 
+#### Energy and Carbon Estimate (Optional)
+
+Set `CCUSAGE_ENERGY_CSV` to a CLEER dashboard CSV (CC BY-NC 4.0, supply your own, it is never bundled) to append an estimate such as `⚡ ~44-66 Wh · 30-45 gCO₂e` to the Claude Code statusline. It uses the Agentic/Typical rows, so it is only valid for agentic sessions. Unset, the output is unchanged.
+
+- `CCUSAGE_ENERGY_CSV`: path to the CLEER CSV. Enables the estimate.
+- `CCUSAGE_GRID_G_PER_KWH`: override the carbon intensity (positive number, gCO₂e per kWh).
+- `CCUSAGE_ENERGY_ONLY`: set to `1` or `true` to drop the carbon figure.
+
+Changing any of these invalidates the statusline cache, so the next run re-renders.
+
 #### Model Label Aliases
 
 Some setups report very long model identifiers. For example, AWS Bedrock

@@ -3,6 +3,7 @@ use crate::cli::{SharedArgs, environment::Environment};
 pub mod cost;
 pub mod date_utils;
 pub mod diagnostics;
+pub mod energy;
 mod error;
 pub mod fast;
 pub mod model_aliases;

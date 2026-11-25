@@ -7,7 +7,9 @@ use std::{
 use ccusage_core::{
     Context, Diagnostics, MILLIS_PER_MINUTE, ReportWindow, Result, TimestampMs,
     cli::{CostSource, SharedArgs, StatuslineArgs, VisualBurnRate},
-    cli_error, format_currency, sum_costs,
+    cli_error,
+    energy::{EnergyConfig, EnergyTable},
+    format_currency, sum_costs,
 };
 use serde::Deserialize;
 
@@ -43,6 +45,9 @@ pub fn run_statusline(args: StatuslineArgs) -> Result<()> {
     let cache_path = statusline_cache_path(&hook.session_id);
     let transcript_path = Path::new(&hook.transcript_path);
     let current_mtime = transcript_mtime_ms(transcript_path).unwrap_or_default();
+    let energy_key = EnergyConfig::from_env()
+        .map(|config| format!("{config:?}"))
+        .unwrap_or_default();
     let initial_cache = if cache_enabled {
         read_statusline_cache(&cache_path)
     } else {
@@ -50,15 +55,26 @@ pub fn run_statusline(args: StatuslineArgs) -> Result<()> {
     };
 
     if let Some(cache) = initial_cache.as_ref()
-        && let Some(output) =
-            cached_statusline_output(cache, current_mtime, now_millis(), args.refresh_interval)
+        && let Some(output) = cached_statusline_output(
+            cache,
+            current_mtime,
+            now_millis(),
+            args.refresh_interval,
+            &energy_key,
+        )
     {
         ccusage_core::outln!("{output}")?;
         return Ok(());
     }
 
     if cache_enabled {
-        mark_statusline_cache_updating(&cache_path, &hook, current_mtime, initial_cache.as_ref());
+        mark_statusline_cache_updating(
+            &cache_path,
+            &hook,
+            current_mtime,
+            initial_cache.as_ref(),
+            energy_key.clone(),
+        );
     }
 
     let diagnostics = Diagnostics::new("claude");
@@ -70,7 +86,13 @@ pub fn run_statusline(args: StatuslineArgs) -> Result<()> {
             if cache_enabled {
                 write_statusline_cache(
                     &cache_path,
-                    StatuslineCache::completed(&hook, statusline, current_mtime, now_millis()),
+                    StatuslineCache::completed(
+                        &hook,
+                        statusline,
+                        current_mtime,
+                        now_millis(),
+                        energy_key,
+                    ),
                 );
             }
         }
@@ -126,8 +148,10 @@ fn render_statusline(
     diagnostics: &Diagnostics,
 ) -> Result<String> {
     let now = shared.clock.now().into();
+    let energy_config = EnergyConfig::from_env();
     let needs_history = matches!(args.cost_source, CostSource::Ccusage | CostSource::Both)
-        || (args.cost_source == CostSource::Auto && hook.cost.is_none());
+        || (args.cost_source == CostSource::Auto && hook.cost.is_none())
+        || energy_config.is_some();
     let history = needs_history
         .then(|| load_entries_since_with_diagnostics(shared, None, diagnostics).ok())
         .flatten();
@@ -141,6 +165,15 @@ fn render_statusline(
         CostSource::Auto => cc_cost.or(ccusage_cost),
         CostSource::Both => None,
     };
+
+    let energy_segment = energy_config
+        .as_ref()
+        .zip(history.as_deref())
+        .and_then(|(config, entries)| {
+            format_session_energy(config, &hook.session_id, entries, shared)
+        })
+        .map(|energy| format!(" | ⚡ {energy}"))
+        .unwrap_or_default();
 
     let today_shared = statusline_today_shared(args, shared, now);
     let today_cost = if let Some(entries) = history.as_ref() {
@@ -242,13 +275,14 @@ fn render_statusline(
     let model_segment = format_model_segment(model_label, hook.effort.as_ref());
 
     Ok(format!(
-        "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
+        "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}{}",
         model_segment,
         session_display,
         format_currency(today_cost),
         block_info,
         burn_rate_info,
-        context_info.unwrap_or_else(|| "N/A".to_string())
+        context_info.unwrap_or_else(|| "N/A".to_string()),
+        energy_segment
     ))
 }
 
@@ -280,6 +314,31 @@ fn calculate_session_cost(session_id: &str, entries: &[ClaudeEntry]) -> f64 {
             })
             .map(|entry| entry.cost),
     )
+}
+
+/// Applies the CLEER estimate per model, then sums. A bad CSV omits the segment rather than failing the statusline.
+fn format_session_energy(
+    config: &EnergyConfig,
+    session_id: &str,
+    entries: &[ClaudeEntry],
+    shared: &SharedArgs,
+) -> Option<String> {
+    let table = EnergyTable::load(Path::new(&config.csv_path))
+        .inspect_err(|error| ccusage_core::debug_log(shared, format!("energy estimate: {error}")))
+        .ok()?;
+    let mut by_model: HashMap<&str, f64> = HashMap::new();
+    for entry in entries.iter().filter(|entry| {
+        entry.recorded_session_id.as_deref() == Some(session_id)
+            || entry.session_id.as_ref() == session_id
+    }) {
+        let model = entry.original_model.as_deref().or(entry.model.as_deref());
+        if let Some(model) = model {
+            *by_model.entry(model).or_default() += entry.cost;
+        }
+    }
+    table
+        .estimate_total(by_model)
+        .map(|estimate| estimate.format(config))
 }
 
 #[derive(Debug, Deserialize)]

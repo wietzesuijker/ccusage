@@ -341,10 +341,11 @@ fn reuses_statusline_cache_while_fresh_and_transcript_unchanged() {
         transcript_mtime: 123,
         is_updating: false,
         pid: None,
+        energy_key: String::new(),
     };
 
     assert_eq!(
-        cached_statusline_output(&cache, 123, 10_500, 1),
+        cached_statusline_output(&cache, 123, 10_500, 1, ""),
         Some("cached status")
     );
 }
@@ -359,9 +360,34 @@ fn invalidates_statusline_cache_when_transcript_changes() {
         transcript_mtime: 123,
         is_updating: false,
         pid: None,
+        energy_key: String::new(),
     };
 
-    assert_eq!(cached_statusline_output(&cache, 456, 10_500, 1), None);
+    assert_eq!(cached_statusline_output(&cache, 456, 10_500, 1, ""), None);
+}
+
+#[test]
+fn invalidates_statusline_cache_when_energy_settings_change() {
+    let cache = StatuslineCache {
+        date: "2026-01-01T00:00:00.000Z".to_string(),
+        last_output: "cached status".to_string(),
+        last_update_time: 10_000,
+        transcript_path: "/tmp/transcript.jsonl".to_string(),
+        transcript_mtime: 123,
+        is_updating: false,
+        pid: None,
+        energy_key: "a.csv".to_string(),
+    };
+
+    assert_eq!(
+        cached_statusline_output(&cache, 123, 10_500, 1, "a.csv"),
+        Some("cached status")
+    );
+    assert_eq!(
+        cached_statusline_output(&cache, 123, 10_500, 1, "b.csv"),
+        None
+    );
+    assert_eq!(cached_statusline_output(&cache, 123, 10_500, 1, ""), None);
 }
 
 #[test]
@@ -374,10 +400,11 @@ fn returns_stale_statusline_cache_while_live_process_is_updating() {
         transcript_mtime: 123,
         is_updating: true,
         pid: Some(std::process::id()),
+        energy_key: String::new(),
     };
 
     assert_eq!(
-        cached_statusline_output(&cache, 456, 20_000, 1),
+        cached_statusline_output(&cache, 456, 20_000, 1, ""),
         Some("stale status")
     );
 }
@@ -454,4 +481,91 @@ fn parses_statusline_hook_with_and_without_effort() {
         Some("xhigh")
     );
     assert!(without_effort.effort.is_none());
+}
+
+#[test]
+fn energy_segment_appears_only_when_the_cleer_csv_is_configured() {
+    ccusage_test_support::install_pricing_snapshots();
+    // Synthetic rows, not CLEER data: Opus 4.5 at 100 Wh/USD with a 50% band and 0.6 gCO2e/Wh.
+    let fixture = fs_fixture!({
+        "ccusage.json": r#"{"defaults":{"pricingOverrides":{"claude-opus-4-5":{"inputCostPerToken":0.00001}}}}"#,
+        "cleer.csv": "model_name,use_case,tier,energy_wh_mean,energy_wh_sd,carbon_gco2e_mean,energy_wh_per_usd\nClaude Opus 4.5,Agentic,Typical,10,5,6,100\n",
+        "projects/project/session.jsonl": r#"{"timestamp":"2020-01-01T00:00:00.000Z","sessionId":"session","message":{"id":"message","model":"claude-opus-4-5","usage":{"input_tokens":100000,"output_tokens":0}}}"#,
+    });
+    let render = |vars: Vec<(&'static str, Option<std::ffi::OsString>)>| {
+        let mut output = String::new();
+        let mut vars = vars;
+        vars.push(("CLAUDE_CONFIG_DIR", Some(fixture.root().into())));
+        Environment::with_vars(vars).run(|| {
+            let config_path = fixture.path("ccusage.json").to_string_lossy().into_owned();
+            let config = ConfigContext::from_args(&[
+                "statusline".to_string(),
+                "--config".to_string(),
+                config_path.clone(),
+            ]);
+            let command = parse_from_with_config(
+                [
+                    "ccusage",
+                    "statusline",
+                    "--config",
+                    config_path.as_str(),
+                    "--cost-source",
+                    "ccusage",
+                ]
+                .into_iter()
+                .map(OsString::from),
+                &config,
+            )
+            .unwrap();
+            let Command::Statusline(args) = command else {
+                panic!("expected statusline command");
+            };
+            let hook = StatuslineHook {
+                session_id: "session".to_string(),
+                transcript_path: fixture
+                    .path("transcript.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+                model: HookModel {
+                    id: Some("claude-opus-4-5".to_string()),
+                    display_name: "Opus".to_string(),
+                },
+                cost: None,
+                context_window: Some(HookContext {
+                    total_input_tokens: 1,
+                    context_window_size: 200_000,
+                }),
+                effort: None,
+            };
+            let shared = statusline_shared(&args);
+            output = render_statusline(&hook, &args, &shared, &Diagnostics::new("claude")).unwrap();
+        });
+        output
+    };
+    let csv = || Some(fixture.path("cleer.csv").into_os_string());
+    let none = || None::<std::ffi::OsString>;
+
+    let unset = render(vec![("CCUSAGE_ENERGY_CSV", none())]);
+    assert!(!unset.contains('⚡'), "{unset}");
+
+    let both = render(vec![("CCUSAGE_ENERGY_CSV", csv())]);
+    assert_eq!(both, format!("{unset} | ⚡ 50-150 Wh · 30-90 gCO₂e"));
+
+    let energy_only = render(vec![
+        ("CCUSAGE_ENERGY_CSV", csv()),
+        ("CCUSAGE_ENERGY_ONLY", Some("1".into())),
+    ]);
+    assert!(energy_only.ends_with(" | ⚡ 50-150 Wh"), "{energy_only}");
+
+    let grid = render(vec![
+        ("CCUSAGE_ENERGY_CSV", csv()),
+        ("CCUSAGE_GRID_G_PER_KWH", Some("1000".into())),
+    ]);
+    assert!(grid.ends_with(" | ⚡ 50-150 Wh · 50-150 gCO₂e"), "{grid}");
+
+    let missing = render(vec![(
+        "CCUSAGE_ENERGY_CSV",
+        Some("/nonexistent/cleer.csv".into()),
+    )]);
+    assert_eq!(missing, unset);
 }

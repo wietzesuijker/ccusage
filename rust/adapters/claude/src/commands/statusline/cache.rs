@@ -24,6 +24,9 @@ pub(super) struct StatuslineCache {
     #[serde(rename = "isUpdating", default)]
     pub(super) is_updating: bool,
     pub(super) pid: Option<u32>,
+    /// Energy env settings the output was rendered with; empty when the estimate is off.
+    #[serde(rename = "energyKey", default)]
+    pub(super) energy_key: String,
 }
 
 impl StatuslineCache {
@@ -32,6 +35,7 @@ impl StatuslineCache {
         last_output: String,
         transcript_mtime: u64,
         last_update_time: u64,
+        energy_key: String,
     ) -> Self {
         Self {
             date: format_cache_date(last_update_time),
@@ -41,10 +45,16 @@ impl StatuslineCache {
             transcript_mtime,
             is_updating: false,
             pid: None,
+            energy_key,
         }
     }
 
-    fn updating(hook: &StatuslineHook, transcript_mtime: u64, previous: Option<&Self>) -> Self {
+    fn updating(
+        hook: &StatuslineHook,
+        transcript_mtime: u64,
+        previous: Option<&Self>,
+        energy_key: String,
+    ) -> Self {
         let now = now_millis();
         Self {
             date: format_cache_date(now),
@@ -58,17 +68,19 @@ impl StatuslineCache {
             transcript_mtime,
             is_updating: true,
             pid: Some(std::process::id()),
+            energy_key,
         }
     }
 }
 
-pub(super) fn cached_statusline_output(
-    cache: &StatuslineCache,
+pub(super) fn cached_statusline_output<'a>(
+    cache: &'a StatuslineCache,
     current_mtime: u64,
     now: u64,
     refresh_interval: u64,
-) -> Option<&str> {
-    if cache.last_output.is_empty() {
+    energy_key: &str,
+) -> Option<&'a str> {
+    if cache.last_output.is_empty() || cache.energy_key != energy_key {
         return None;
     }
     let expired =
@@ -120,10 +132,11 @@ pub(super) fn mark_statusline_cache_updating(
     hook: &StatuslineHook,
     transcript_mtime: u64,
     previous: Option<&StatuslineCache>,
+    energy_key: String,
 ) {
     write_statusline_cache(
         path,
-        StatuslineCache::updating(hook, transcript_mtime, previous),
+        StatuslineCache::updating(hook, transcript_mtime, previous, energy_key),
     );
 }
 
